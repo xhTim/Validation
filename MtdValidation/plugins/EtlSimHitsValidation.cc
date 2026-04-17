@@ -46,7 +46,7 @@ struct PrimaryPionSideSummary {
   int nSimHits = 0;
 
   // store (zside, disk, face) for each hit
-  std::vector<std::tuple<int, int, int>> hitLocations;
+  std::vector<std::tuple<int, int, int, unsigned int>> hitLocations;
 
   // whether this primary pion has a hit on each face of a given disk
   bool d1Face1 = false;
@@ -64,8 +64,8 @@ struct PrimaryPionSideSummary {
     }
   }
 
-  void addHitLocation(int zside, int disc, int face) {
-    hitLocations.emplace_back(zside, disc, face);
+  void addHitLocation(int zside, int disc, int face, unsigned int detId) {
+    hitLocations.emplace_back(zside, disc, face,detId);
   }
 
   bool hasBothFacesSameDisk() const {
@@ -205,23 +205,23 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
       continue;
     }
 
-  if (std::abs(simHit.particleType()) == 211 && (simHit.trackId() == 1 || simHit.trackId() == 2)) {
-    PrimaryPionSideSummary* pionSummary = nullptr;
+    if (std::abs(simHit.particleType()) == 211 && (simHit.trackId() == 1 || simHit.trackId() == 2)) {
+      PrimaryPionSideSummary* pionSummary = nullptr;
 
-    if (id.zside() == -1) {
-      pionSummary = &pionNegZ;
-    } else if (id.zside() == 1) {
-      pionSummary = &pionPosZ;
+      if (id.zside() == -1 && simHit.particleType() == -211) {
+        pionSummary = &pionNegZ;
+      } else if (id.zside() == 1 && simHit.particleType() == 211) {
+        pionSummary = &pionPosZ;
+      }
+
+      if (pionSummary != nullptr) {
+        pionSummary->nSimHits++;
+
+        // ETLDetId::discSide() is the face index
+        pionSummary->fillFace(id.nDisc(), id.discSide());
+        pionSummary->addHitLocation(id.zside(), id.nDisc(), id.discSide(), id.rawId());
+      }
     }
-
-    if (pionSummary != nullptr) {
-      pionSummary->nSimHits++;
-
-      // ETLDetId::discSide() is the face index
-      pionSummary->fillFace(id.nDisc(), id.discSide());
-      pionSummary->addHitLocation(id.zside(), id.nDisc(), id.discSide());
-    }
-  }
 
     const auto& position = simHit.localPosition();
 
@@ -359,12 +359,13 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
     }
 
     for (size_t i = 0; i < pion.hitLocations.size(); ++i) {
-      const auto& [zside, disc, face] = pion.hitLocations[i];
+      const auto& [zside, disc, face, detId] = pion.hitLocations[i];
       edm::LogPrint("EtlSimHitsValidation")
           << "  hit " << i
           << " : zside = " << zside
           << ", disk = " << disc
-          << ", face = " << face;
+          << ", face = " << face
+          << ", detId = " << detId;
     }
   }
 };
