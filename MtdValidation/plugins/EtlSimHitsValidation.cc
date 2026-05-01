@@ -32,6 +32,8 @@
 #include "SimDataFormats/CrossingFrame/interface/CrossingFrame.h"
 #include "SimDataFormats/CrossingFrame/interface/MixCollection.h"
 #include "SimDataFormats/TrackingHit/interface/PSimHit.h"
+#include "SimDataFormats/Track/interface/SimTrack.h"
+#include "SimDataFormats/Track/interface/SimTrackContainer.h"
 
 #include "SimFastTiming/FastTimingCommon/interface/MTDDigitizerTypes.h"
 #include "Geometry/MTDGeometryBuilder/interface/MTDGeomUtil.h"
@@ -55,6 +57,16 @@ struct EnteringTrackDiskSummary {
   // First index: 0 = D1, 1 = D2.
   // Second index follows ETLDetId::discSide(): 0 = front, 1 = back.
   std::array<std::array<int, 2>, 2> nSimHitsPerDiskFace{{{{0, 0}}, {{0, 0}}}};
+
+  // Production pT of the SimTrack corresponding to this originalTrackId.
+  // This is not the local momentum at ETL; it is SimTrack::momentum().pt().
+  float trackPtAtProduction = -1.f;
+  bool hasTrackPtAtProduction = false;
+
+  void setTrackPtAtProduction(float pt) {
+    trackPtAtProduction = pt;
+    hasTrackPtAtProduction = true;
+  }
 
   void addHit(int disc, int face) {
     if (disc < 1 || disc > 2)
@@ -88,6 +100,7 @@ private:
   const bool optionalPlots_;
 
   edm::EDGetTokenT<CrossingFrame<PSimHit>> etlSimHitsToken_;
+  edm::EDGetTokenT<edm::SimTrackContainer> simTracksToken_;
 
   edm::ESGetToken<MTDGeometry, MTDDigiGeometryRecord> mtdgeoToken_;
   edm::ESGetToken<MTDTopology, MTDTopologyRcd> mtdtopoToken_;
@@ -138,6 +151,7 @@ EtlSimHitsValidation::EtlSimHitsValidation(const edm::ParameterSet& iConfig)
       hitMinEnergy2Dis_(iConfig.getParameter<double>("hitMinimumEnergy2Dis")),
       optionalPlots_(iConfig.getParameter<bool>("optionalPlots")) {
   etlSimHitsToken_ = consumes<CrossingFrame<PSimHit>>(iConfig.getParameter<edm::InputTag>("inputTag"));
+  simTracksToken_ = consumes<edm::SimTrackContainer>(iConfig.getParameter<edm::InputTag>("simTrackTag"));
   mtdgeoToken_ = esConsumes<MTDGeometry, MTDDigiGeometryRecord>();
   mtdtopoToken_ = esConsumes<MTDTopology, MTDTopologyRcd>();
 }
@@ -160,6 +174,14 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
   auto etlSimHitsHandle = makeValid(iEvent.getHandle(etlSimHitsToken_));
   MixCollection<PSimHit> etlSimHits(etlSimHitsHandle.product());
+
+  auto simTracksHandle = makeValid(iEvent.getHandle(simTracksToken_));
+  const edm::SimTrackContainer& simTracks = *simTracksHandle;
+
+  std::unordered_map<unsigned int, float> simTrackPtAtProduction;
+  for (auto const& simTrack : simTracks) {
+    simTrackPtAtProduction[simTrack.trackId()] = simTrack.momentum().pt();
+  }
 
   std::unordered_map<mtd_digitizer::MTDCellId, MTDHit> m_etlHits[4];
   std::unordered_map<mtd_digitizer::MTDCellId, std::set<int>> m_etlTrkPerCell[4];
@@ -194,7 +216,17 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
     // Define an entering particle by the original Geant track id.
     // Fold +Z and -Z together and only distinguish D1 and D2 for this study.
     // ETLDetId::discSide() returns 0 = front, 1 = back.
-    enteringTracks[simHit.originalTrackId()].addHit(id.nDisc(), id.discSide());
+    auto& enteringTrackSummary = enteringTracks[simHit.originalTrackId()];
+    enteringTrackSummary.addHit(id.nDisc(), id.discSide());
+
+    // Use the production pT of the SimTrack corresponding to originalTrackId.
+    // This is the momentum when that SimTrack was created, not the local momentum at ETL.
+    if (!enteringTrackSummary.hasTrackPtAtProduction) {
+      auto itPt = simTrackPtAtProduction.find(static_cast<unsigned int>(simHit.originalTrackId()));
+      if (itPt != simTrackPtAtProduction.end()) {
+        enteringTrackSummary.setTrackPtAtProduction(itPt->second);
+      }
+    }
 
     const auto& position = simHit.localPosition();
 
@@ -310,12 +342,12 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
   for (const auto& enteringTrack : enteringTracks) {
     const auto& summary = enteringTrack.second;
 
-    if (summary.nSimHitsPerDisk[0] > 0) {
-      meNSimHitsPerEnteringTrackD1_->Fill(summary.nSimHitsPerDisk[0]);
+    if (summary.nSimHitsPerDisk[0] > 0 && summary.hasTrackPtAtProduction) {
+      meNSimHitsPerEnteringTrackD1_->Fill(summary.nSimHitsPerDisk[0], summary.trackPtAtProduction);
     }
 
-    if (summary.nSimHitsPerDisk[1] > 0) {
-      meNSimHitsPerEnteringTrackD2_->Fill(summary.nSimHitsPerDisk[1]);
+    if (summary.nSimHitsPerDisk[1] > 0 && summary.hasTrackPtAtProduction) {
+      meNSimHitsPerEnteringTrackD2_->Fill(summary.nSimHitsPerDisk[1], summary.trackPtAtProduction);
     }
 
     if (summary.nSimHitsPerDisk[0] > 0) {
@@ -624,18 +656,24 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
       "EtlHitTvsEtaZposD2", "ETL SIM time vs #eta (+Z, Second disk);#eta_{SIM};T_{SIM} [ns]", 50, 1.56, 3.2, 0., 100.);
 
   meNSimHitsPerEnteringTrackD1_ =
-      ibook.book1D("NSimHitsPerEnteringTrackD1",
-                   "ETL SIM hits per entering track in D1;N_{SIM hits in D1 per originalTrackId};Entries",
+      ibook.book2D("NSimHitsPerEnteringTrackD1",
+                   "ETL SIM hits per entering track in D1;N_{SIM hits in D1 per originalTrackId};p_{T}^{SimTrack at production} [GeV]",
                    15,
                    -0.5,
-                   14.5);
+                   14.5,
+                   100,
+                   0.,
+                   10.);
 
   meNSimHitsPerEnteringTrackD2_ =
-      ibook.book1D("NSimHitsPerEnteringTrackD2",
-                   "ETL SIM hits per entering track in D2;N_{SIM hits in D2 per originalTrackId};Entries",
+      ibook.book2D("NSimHitsPerEnteringTrackD2",
+                   "ETL SIM hits per entering track in D2;N_{SIM hits in D2 per originalTrackId};p_{T}^{SimTrack at production} [GeV]",
                    15,
                    -0.5,
-                   14.5);
+                   14.5,
+                   100,
+                   0.,
+                   10.);
 
   meNSimHitsFace2VsFace1D1_ =
       ibook.book2D("NSimHitsFace2VsFace1D1",
@@ -680,6 +718,7 @@ void EtlSimHitsValidation::fillDescriptions(edm::ConfigurationDescriptions& desc
 
   desc.add<std::string>("folder", "MTD/ETL/SimHits");
   desc.add<edm::InputTag>("inputTag", edm::InputTag("mix", "g4SimHitsFastTimerHitsEndcap"));
+  desc.add<edm::InputTag>("simTrackTag", edm::InputTag("g4SimHits"));
   desc.add<double>("hitMinimumEnergy2Dis", 0.001);  // [MeV]
   desc.add<bool>("optionalPlots", false);
 
