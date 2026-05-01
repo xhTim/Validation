@@ -12,6 +12,10 @@
 */
 
 #include <string>
+#include <array>
+#include <map>
+#include <set>
+#include <unordered_map>
 
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/Event.h"
@@ -42,40 +46,26 @@
 
 #include "DataFormats/Math/interface/angle_units.h"
 
-struct PrimaryPionSideSummary {
-  int nSimHits = 0;
+struct EnteringTrackDiskSummary {
+  // Number of ETL SIM hits for this originalTrackId, folding +Z and -Z together.
+  // Index 0 = D1, index 1 = D2.
+  std::array<int, 2> nSimHitsPerDisk{{0, 0}};
 
-  // store (zside, disk, face) for each hit
-  std::vector<std::tuple<int, int, int, unsigned int>> hitLocations;
+  // Number of ETL SIM hits on each face for this originalTrackId.
+  // First index: 0 = D1, 1 = D2.
+  // Second index follows ETLDetId::discSide(): 0 = front, 1 = back.
+  std::array<std::array<int, 2>, 2> nSimHitsPerDiskFace{{{{0, 0}}, {{0, 0}}}};
 
-  // whether this primary pion has a hit on each face of a given disk
-  bool d1Face1 = false;
-  bool d1Face2 = false;
-  bool d2Face1 = false;
-  bool d2Face2 = false;
+  void addHit(int disc, int face) {
+    if (disc < 1 || disc > 2)
+      return;
 
-  void fillFace(int disc, int face) {
-    if (disc == 1) {
-      if (face == 0) d1Face1 = true;
-      if (face == 1) d1Face2 = true;
-    } else if (disc == 2) {
-      if (face == 0) d2Face1 = true;
-      if (face == 1) d2Face2 = true;
+    const int diskIndex = disc - 1;
+    ++nSimHitsPerDisk[diskIndex];
+
+    if (face == 0 || face == 1) {
+      ++nSimHitsPerDiskFace[diskIndex][face];
     }
-  }
-
-  void addHitLocation(int zside, int disc, int face, unsigned int detId) {
-    hitLocations.emplace_back(zside, disc, face,detId);
-  }
-
-  bool hasBothFacesSameDisk() const {
-    return (d1Face1 && d1Face2) || (d2Face1 && d2Face2);
-  }
-
-  int bothFacesDiskIndex() const {
-    if (d1Face1 && d1Face2) return 1;
-    if (d2Face1 && d2Face2) return 2;
-    return 0;
   }
 };
 
@@ -128,9 +118,10 @@ private:
   MonitorElement* meHitTvsPhi_[4];
   MonitorElement* meHitTvsEta_[4];
 
-  MonitorElement* meNSimHitsPerPrimaryPion_ = nullptr;
-  MonitorElement* meHasBothFacesSameDisk_ = nullptr;
-  MonitorElement* meBothFacesDiskIndex_ = nullptr;
+  MonitorElement* meNSimHitsPerEnteringTrackD1_ = nullptr;
+  MonitorElement* meNSimHitsPerEnteringTrackD2_ = nullptr;
+  MonitorElement* meNSimHitsFace2VsFace1D1_ = nullptr;
+  MonitorElement* meNSimHitsFace2VsFace1D2_ = nullptr;
 
   // folding positive and negative z
   MonitorElement* meHitThetaEntryD1_[3];
@@ -173,8 +164,7 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
   std::unordered_map<mtd_digitizer::MTDCellId, MTDHit> m_etlHits[4];
   std::unordered_map<mtd_digitizer::MTDCellId, std::set<int>> m_etlTrkPerCell[4];
 
-  PrimaryPionSideSummary pionNegZ;
-  PrimaryPionSideSummary pionPosZ;
+  std::map<int, EnteringTrackDiskSummary> enteringTracks;
 
   // --- Loop over the ETL SIM hits
 
@@ -186,10 +176,6 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
     index++;
     LogDebug("EtlSimHitsValidation") << "SimHit # " << index << " detId " << simHit.detUnitId() << " ene "
                                      << simHit.energyLoss() << " tof " << simHit.tof() << " tId " << simHit.trackId();
-
-    // --- Use only hits compatible with the in-time bunch-crossing
-    if (simHit.tof() < 0 || simHit.tof() > 25.)
-      continue;
 
     ETLDetId id = simHit.detUnitId();
     if ((id.zside() == -1) && (id.nDisc() == 1)) {
@@ -205,23 +191,10 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
       continue;
     }
 
-    if (std::abs(simHit.particleType()) == 211 && (simHit.trackId() == 1 || simHit.trackId() == 2)) {
-      PrimaryPionSideSummary* pionSummary = nullptr;
-
-      if (id.zside() == -1 && simHit.particleType() == -211) {
-        pionSummary = &pionNegZ;
-      } else if (id.zside() == 1 && simHit.particleType() == 211) {
-        pionSummary = &pionPosZ;
-      }
-
-      if (pionSummary != nullptr) {
-        pionSummary->nSimHits++;
-
-        // ETLDetId::discSide() is the face index
-        pionSummary->fillFace(id.nDisc(), id.discSide());
-        pionSummary->addHitLocation(id.zside(), id.nDisc(), id.discSide(), id.rawId());
-      }
-    }
+    // Define an entering particle by the original Geant track id.
+    // Fold +Z and -Z together and only distinguish D1 and D2 for this study.
+    // ETLDetId::discSide() returns 0 = front, 1 = back.
+    enteringTracks[simHit.originalTrackId()].addHit(id.nDisc(), id.discSide());
 
     const auto& position = simHit.localPosition();
 
@@ -334,53 +307,25 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
   }  // idet loop
 
-  auto printPionHitLocations = [&](const char* label, const PrimaryPionSideSummary& pion) {
-  bool printForMultiplicity = (pion.nSimHits >= 3);
-  bool printForBothFaces = pion.hasBothFacesSameDisk();
+  for (const auto& enteringTrack : enteringTracks) {
+    const auto& summary = enteringTrack.second;
 
-  if (printForMultiplicity || printForBothFaces) {
-    if (printForMultiplicity && printForBothFaces) {
-      edm::LogPrint("EtlSimHitsValidation")
-          << "Event " << iEvent.id().event()
-          << " : " << label
-          << " primary pion is printed because nSimHits = " << pion.nSimHits
-          << " (>=3) and hasBothFacesSameDisk() is true";
-    } else if (printForMultiplicity) {
-      edm::LogPrint("EtlSimHitsValidation")
-          << "Event " << iEvent.id().event()
-          << " : " << label
-          << " primary pion is printed because nSimHits = " << pion.nSimHits
-          << " (>=3)";
-    } else if (printForBothFaces) {
-      edm::LogPrint("EtlSimHitsValidation")
-          << "Event " << iEvent.id().event()
-          << " : " << label
-          << " primary pion is printed because hasBothFacesSameDisk() is true";
+    if (summary.nSimHitsPerDisk[0] > 0) {
+      meNSimHitsPerEnteringTrackD1_->Fill(summary.nSimHitsPerDisk[0]);
     }
 
-    for (size_t i = 0; i < pion.hitLocations.size(); ++i) {
-      const auto& [zside, disc, face, detId] = pion.hitLocations[i];
-      edm::LogPrint("EtlSimHitsValidation")
-          << "  hit " << i
-          << " : zside = " << zside
-          << ", disk = " << disc
-          << ", face = " << face
-          << ", detId = " << detId;
+    if (summary.nSimHitsPerDisk[1] > 0) {
+      meNSimHitsPerEnteringTrackD2_->Fill(summary.nSimHitsPerDisk[1]);
+    }
+
+    if (summary.nSimHitsPerDisk[0] > 0) {
+      meNSimHitsFace2VsFace1D1_->Fill(summary.nSimHitsPerDiskFace[0][0], summary.nSimHitsPerDiskFace[0][1]);
+    }
+
+    if (summary.nSimHitsPerDisk[1] > 0) {
+      meNSimHitsFace2VsFace1D2_->Fill(summary.nSimHitsPerDiskFace[1][0], summary.nSimHitsPerDiskFace[1][1]);
     }
   }
-};
-
-  printPionHitLocations("negZ", pionNegZ);
-  printPionHitLocations("posZ", pionPosZ);
-
-  meNSimHitsPerPrimaryPion_->Fill(pionNegZ.nSimHits);
-  meNSimHitsPerPrimaryPion_->Fill(pionPosZ.nSimHits);
-
-  meHasBothFacesSameDisk_->Fill(pionNegZ.hasBothFacesSameDisk() ? 1 : 0);
-  meHasBothFacesSameDisk_->Fill(pionPosZ.hasBothFacesSameDisk() ? 1 : 0);
-
-  meBothFacesDiskIndex_->Fill(pionNegZ.bothFacesDiskIndex());
-  meBothFacesDiskIndex_->Fill(pionPosZ.bothFacesDiskIndex());
 }
 
 // ------------ method for histogram booking ------------
@@ -678,26 +623,39 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
   meHitTvsEta_[3] = ibook.bookProfile(
       "EtlHitTvsEtaZposD2", "ETL SIM time vs #eta (+Z, Second disk);#eta_{SIM};T_{SIM} [ns]", 50, 1.56, 3.2, 0., 100.);
 
-  meNSimHitsPerPrimaryPion_ =
-    ibook.book1D("NSimHitsPerPrimaryPion",
-                 "ETL SIM hits per primary pion;N_{SIM hits per primary pion};Entries",
-                 20,
-                 -0.5,
-                 19.5);
+  meNSimHitsPerEnteringTrackD1_ =
+      ibook.book1D("NSimHitsPerEnteringTrackD1",
+                   "ETL SIM hits per entering track in D1;N_{SIM hits in D1 per originalTrackId};Entries",
+                   15,
+                   -0.5,
+                   14.5);
 
-  meHasBothFacesSameDisk_ =
-    ibook.book1D("HasBothFacesSameDisk",
-                 "Primary pion has hits on both faces of the same disk;Flag (0=no, 1=yes);Entries",
-                 2,
-                 -0.5,
-                 1.5);
+  meNSimHitsPerEnteringTrackD2_ =
+      ibook.book1D("NSimHitsPerEnteringTrackD2",
+                   "ETL SIM hits per entering track in D2;N_{SIM hits in D2 per originalTrackId};Entries",
+                   15,
+                   -0.5,
+                   14.5);
 
-  meBothFacesDiskIndex_ =
-    ibook.book1D("BothFacesDiskIndex",
-                 "Disk index for same-disk both-face hits;Disk index (0=none, 1=D1, 2=D2);Entries",
-                 3,
-                 -0.5,
-                 2.5);
+  meNSimHitsFace2VsFace1D1_ =
+      ibook.book2D("NSimHitsFace2VsFace1D1",
+                   "ETL SIM hits per entering track in D1;N_{SIM hits on front face};N_{SIM hits on back face}",
+                   10,
+                   -0.5,
+                   9.5,
+                   10,
+                   -0.5,
+                   9.5);
+
+  meNSimHitsFace2VsFace1D2_ =
+      ibook.book2D("NSimHitsFace2VsFace1D2",
+                   "ETL SIM hits per entering track in D2;N_{SIM hits on front face};N_{SIM hits on back face}",
+                   10,
+                   -0.5,
+                   9.5,
+                   10,
+                   -0.5,
+                   9.5);
 
   if (optionalPlots_) {
     meHitThetaEntryD1_[0] =
