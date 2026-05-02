@@ -16,6 +16,9 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <vector>
+#include <cmath>
+#include <limits>
 
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/Event.h"
@@ -49,17 +52,19 @@
 #include "DataFormats/Math/interface/angle_units.h"
 
 struct EnteringTrackDiskSummary {
-  // Number of ETL SIM hits for this originalTrackId, folding +Z and -Z together.
-  // Index 0 = D1, index 1 = D2.
+  struct HitInfo {
+    float x = 0.f;
+    float y = 0.f;
+    float z = 0.f;
+    float tof = 0.f;
+    int face = -1;
+    int offsetTrackId = -999;
+  };
+
   std::array<int, 2> nSimHitsPerDisk{{0, 0}};
-
-  // Number of ETL SIM hits on each face for this originalTrackId.
-  // First index: 0 = D1, 1 = D2.
-  // Second index follows ETLDetId::discSide(): 0 = front, 1 = back.
   std::array<std::array<int, 2>, 2> nSimHitsPerDiskFace{{{{0, 0}}, {{0, 0}}}};
+  std::array<std::vector<HitInfo>, 2> hitsPerDisk;
 
-  // Production pT of the SimTrack corresponding to this originalTrackId.
-  // This is not the local momentum at ETL; it is SimTrack::momentum().pt().
   float trackPtAtProduction = -1.f;
   bool hasTrackPtAtProduction = false;
 
@@ -68,7 +73,7 @@ struct EnteringTrackDiskSummary {
     hasTrackPtAtProduction = true;
   }
 
-  void addHit(int disc, int face) {
+  void addHit(int disc, int face, float x, float y, float z, float tof, int offsetTrackId) {
     if (disc < 1 || disc > 2)
       return;
 
@@ -78,8 +83,77 @@ struct EnteringTrackDiskSummary {
     if (face == 0 || face == 1) {
       ++nSimHitsPerDiskFace[diskIndex][face];
     }
+
+    hitsPerDisk[diskIndex].push_back({x, y, z, tof, face, offsetTrackId});
   }
 };
+
+struct DispersionResult {
+  float maxPairwiseXY = 0.f;
+  float maxPairwise3D = 0.f;
+  float rmsXY = 0.f;
+  float timeSpread = 0.f;
+  int latestOffsetTrackId = -999;
+};
+
+static DispersionResult computeDispersion(const std::vector<EnteringTrackDiskSummary::HitInfo>& hits) {
+  DispersionResult result;
+
+  const size_t nHits = hits.size();
+  if (nHits == 0) {
+    return result;
+  }
+
+  float minTof = std::numeric_limits<float>::max();
+  float maxTof = -std::numeric_limits<float>::max();
+
+  float meanX = 0.f;
+  float meanY = 0.f;
+
+  for (const auto& hit : hits) {
+    meanX += hit.x;
+    meanY += hit.y;
+
+    if (hit.tof < minTof)
+      minTof = hit.tof;
+    if (hit.tof > maxTof) {
+      maxTof = hit.tof;
+      result.latestOffsetTrackId = hit.offsetTrackId;
+    }
+  }
+
+  meanX /= static_cast<float>(nHits);
+  meanY /= static_cast<float>(nHits);
+
+  float sumR2 = 0.f;
+  for (const auto& hit : hits) {
+    const float dx = hit.x - meanX;
+    const float dy = hit.y - meanY;
+    sumR2 += dx * dx + dy * dy;
+  }
+
+  result.rmsXY = std::sqrt(sumR2 / static_cast<float>(nHits));
+  result.timeSpread = maxTof - minTof;
+
+  for (size_t i = 0; i < nHits; ++i) {
+    for (size_t j = i + 1; j < nHits; ++j) {
+      const float dx = hits[i].x - hits[j].x;
+      const float dy = hits[i].y - hits[j].y;
+      const float dz = hits[i].z - hits[j].z;
+
+      const float distXY = std::sqrt(dx * dx + dy * dy);
+      const float dist3D = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+      if (distXY > result.maxPairwiseXY)
+        result.maxPairwiseXY = distXY;
+
+      if (dist3D > result.maxPairwise3D)
+        result.maxPairwise3D = dist3D;
+    }
+  }
+
+  return result;
+}
 
 class EtlSimHitsValidation : public DQMEDAnalyzer {
 public:
@@ -93,8 +167,6 @@ private:
 
   void analyze(const edm::Event&, const edm::EventSetup&) override;
 
-  // ------------ member data ------------
-
   const std::string folder_;
   const float hitMinEnergy2Dis_;
   const bool optionalPlots_;
@@ -104,8 +176,6 @@ private:
 
   edm::ESGetToken<MTDGeometry, MTDDigiGeometryRecord> mtdgeoToken_;
   edm::ESGetToken<MTDTopology, MTDTopologyRcd> mtdtopoToken_;
-
-  // --- histograms declaration
 
   MonitorElement* meNhits_[4];
   MonitorElement* meNtrkPerCell_[4];
@@ -136,16 +206,22 @@ private:
   MonitorElement* meNSimHitsFace2VsFace1D1_ = nullptr;
   MonitorElement* meNSimHitsFace2VsFace1D2_ = nullptr;
 
-  // folding positive and negative z
+  MonitorElement* meSpaceDispersionXYD1_ = nullptr;
+  MonitorElement* meSpaceDispersionXYD2_ = nullptr;
+  MonitorElement* meSpaceDispersionRMSD1_ = nullptr;
+  MonitorElement* meSpaceDispersionRMSD2_ = nullptr;
+  MonitorElement* meTimeDispersionD1_ = nullptr;
+  MonitorElement* meTimeDispersionD2_ = nullptr;
+  MonitorElement* meTimeDispersionLatestOffset4D1_ = nullptr;
+  MonitorElement* meTimeDispersionLatestOffset4D2_ = nullptr;
+
   MonitorElement* meHitThetaEntryD1_[3];
   MonitorElement* meHitThetaEntryD2_[3];
 
-  // Eta bins for hit properties studies
   static constexpr int n_bin_Eta = 3;
   static constexpr double eta_bins_edges[n_bin_Eta + 1] = {1.5, 2.1, 2.5, 3.0};
 };
 
-// ------------ constructor and destructor --------------
 EtlSimHitsValidation::EtlSimHitsValidation(const edm::ParameterSet& iConfig)
     : folder_(iConfig.getParameter<std::string>("folder")),
       hitMinEnergy2Dis_(iConfig.getParameter<double>("hitMinimumEnergy2Dis")),
@@ -158,7 +234,6 @@ EtlSimHitsValidation::EtlSimHitsValidation(const edm::ParameterSet& iConfig)
 
 EtlSimHitsValidation::~EtlSimHitsValidation() {}
 
-// ------------ method called for each event  ------------
 void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSetup& iSetup) {
   using namespace edm;
   using namespace geant_units::operators;
@@ -188,10 +263,7 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
   std::map<int, EnteringTrackDiskSummary> enteringTracks;
 
-  // --- Loop over the ETL SIM hits
-
   int idet = 999;
-
   size_t index(0);
 
   for (auto const& simHit : etlSimHits) {
@@ -213,22 +285,34 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
       continue;
     }
 
-    // Define an entering particle by the original Geant track id.
-    // Fold +Z and -Z together and only distinguish D1 and D2 for this study.
-    // ETLDetId::discSide() returns 0 = front, 1 = back.
-    auto& enteringTrackSummary = enteringTracks[simHit.originalTrackId()];
-    enteringTrackSummary.addHit(id.nDisc(), id.discSide());
+    const auto& position = simHit.localPosition();
 
-    // Use the production pT of the SimTrack corresponding to originalTrackId.
-    // This is the momentum when that SimTrack was created, not the local momentum at ETL.
+    DetId geoIdForThisHit = id.geographicalId();
+    const MTDGeomDet* thedetForThisHit = geom->idToDet(geoIdForThisHit);
+    if (thedetForThisHit == nullptr)
+      throw cms::Exception("EtlSimHitsValidation") << "GeographicalID: " << std::hex << geoIdForThisHit.rawId() << " ("
+                                                   << id.rawId() << ") is invalid!" << std::dec << std::endl;
+
+    Local3DPoint localPointForThisHit(convertMmToCm(position.x()),
+                                      convertMmToCm(position.y()),
+                                      convertMmToCm(position.z()));
+    const auto& globalPointForThisHit = thedetForThisHit->toGlobal(localPointForThisHit);
+
+    auto& enteringTrackSummary = enteringTracks[simHit.originalTrackId()];
+    enteringTrackSummary.addHit(id.nDisc(),
+                                id.discSide(),
+                                globalPointForThisHit.x(),
+                                globalPointForThisHit.y(),
+                                globalPointForThisHit.z(),
+                                simHit.tof(),
+                                simHit.offsetTrackId());
+
     if (!enteringTrackSummary.hasTrackPtAtProduction) {
       auto itPt = simTrackPtAtProduction.find(static_cast<unsigned int>(simHit.originalTrackId()));
       if (itPt != simTrackPtAtProduction.end()) {
         enteringTrackSummary.setTrackPtAtProduction(itPt->second);
       }
     }
-
-    const auto& position = simHit.localPosition();
 
     LocalPoint simscaled(convertMmToCm(position.x()), convertMmToCm(position.y()), convertMmToCm(position.z()));
     std::pair<uint8_t, uint8_t> pixel = geomUtil.pixelInModule(id, simscaled);
@@ -237,10 +321,8 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
     m_etlTrkPerCell[idet][pixelId].insert(simHit.trackId());
     auto simHitIt = m_etlHits[idet].emplace(pixelId, MTDHit()).first;
 
-    // --- Accumulate the energy (in MeV) of SIM hits in the same detector cell
     (simHitIt->second).energy += convertUnitsTo(0.001_MeV, simHit.energyLoss());
 
-    // --- Get the time of the first SIM hit in the cell
     if ((simHitIt->second).time == 0 || simHit.tof() < (simHitIt->second).time) {
       (simHitIt->second).time = simHit.tof();
 
@@ -265,11 +347,7 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
   }  // simHit loop
 
-  // ==============================================================================
-  //  Histogram filling
-  // ==============================================================================
-
-  for (int idet = 0; idet < 4; ++idet) {  //two disks per side
+  for (int idet = 0; idet < 4; ++idet) {
     meNhits_[idet]->Fill(m_etlHits[idet].size());
     LogDebug("EtlSimHitsValidation") << "idet " << idet << " #hits " << m_etlHits[idet].size();
 
@@ -281,7 +359,7 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
       double weight = 1.0;
       if ((hit.second).energy < hitMinEnergy2Dis_)
         continue;
-      // --- Get the SIM hit global position
+
       ETLDetId detId;
       detId = hit.first.detid_;
       DetId geoId = detId.geographicalId();
@@ -297,8 +375,6 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
       if (detId.discSide() == 1) {
         weight = -weight;
       }
-
-      // --- Fill the histograms
 
       meHitEnergy_[idet]->Fill((hit.second).energy);
       meHitTime_[idet]->Fill((hit.second).time);
@@ -334,10 +410,8 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
           }
         }
       }
-
-    }  // hit loop
-
-  }  // idet loop
+    }
+  }
 
   for (const auto& enteringTrack : enteringTracks) {
     const auto& summary = enteringTrack.second;
@@ -352,21 +426,34 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
     if (summary.nSimHitsPerDisk[0] > 0) {
       meNSimHitsFace2VsFace1D1_->Fill(summary.nSimHitsPerDiskFace[0][0], summary.nSimHitsPerDiskFace[0][1]);
+
+      const auto dispersionD1 = computeDispersion(summary.hitsPerDisk[0]);
+      meSpaceDispersionXYD1_->Fill(dispersionD1.maxPairwiseXY);
+      meSpaceDispersionRMSD1_->Fill(dispersionD1.rmsXY);
+      meTimeDispersionD1_->Fill(dispersionD1.timeSpread);
+      if (dispersionD1.latestOffsetTrackId == 0) {
+        meTimeDispersionLatestOffset4D1_->Fill(dispersionD1.timeSpread);
+      }
     }
 
     if (summary.nSimHitsPerDisk[1] > 0) {
       meNSimHitsFace2VsFace1D2_->Fill(summary.nSimHitsPerDiskFace[1][0], summary.nSimHitsPerDiskFace[1][1]);
+
+      const auto dispersionD2 = computeDispersion(summary.hitsPerDisk[1]);
+      meSpaceDispersionXYD2_->Fill(dispersionD2.maxPairwiseXY);
+      meSpaceDispersionRMSD2_->Fill(dispersionD2.rmsXY);
+      meTimeDispersionD2_->Fill(dispersionD2.timeSpread);
+      if (dispersionD2.latestOffsetTrackId == 0) {
+        meTimeDispersionLatestOffset4D2_->Fill(dispersionD2.timeSpread);
+      }
     }
   }
 }
 
-// ------------ method for histogram booking ------------
 void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                                           edm::Run const& run,
                                           edm::EventSetup const& iSetup) {
   ibook.setCurrentFolder(folder_);
-
-  // --- histograms booking
 
   meNhits_[0] = ibook.book1D("EtlNhitsZnegD1",
                              "Number of ETL cells with SIM hits (-Z, Single(topo1D)/First(topo2D) disk);N_{ETL cells}",
@@ -396,6 +483,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                                    10.);
   meNtrkPerCell_[3] =
       ibook.book1D("EtlNtrkPerCellZposD2", "Number of tracks per ETL sensor (+Z, Second disk);N_{trk}", 10, 0., 10.);
+
   meHitEnergy_[0] = ibook.book1D(
       "EtlHitEnergyZnegD1", "ETL SIM hits energy (-Z, Single(topo1D)/First(topo2D) disk);E_{SIM} [MeV]", 100, 0., 1.5);
   meHitEnergy_[1] =
@@ -404,6 +492,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
       "EtlHitEnergyZposD1", "ETL SIM hits energy (+Z, Single(topo1D)/First(topo2D) disk);E_{SIM} [MeV]", 100, 0., 1.5);
   meHitEnergy_[3] =
       ibook.book1D("EtlHitEnergyZposD2", "ETL SIM hits energy (+Z, Second disk);E_{SIM} [MeV]", 100, 0., 1.5);
+
   meHitTime_[0] = ibook.book1D(
       "EtlHitTimeZnegD1", "ETL SIM hits ToA (-Z, Single(topo1D)/First(topo2D) disk);ToA_{SIM} [ns]", 100, 0., 25.);
   meHitTime_[1] = ibook.book1D("EtlHitTimeZnegD2", "ETL SIM hits ToA (-Z, Second disk);ToA_{SIM} [ns]", 100, 0., 25.);
@@ -544,6 +633,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                         100.);
   meHitTvsE_[3] = ibook.bookProfile(
       "EtlHitTvsEZposD2", "ETL SIM time vs energy (+Z, Second disk);E_{SIM} [MeV];T_{SIM} [ns]", 50, 0., 2., 0., 100.);
+
   meHitEvsPhi_[0] =
       ibook.bookProfile("EtlHitEvsPhiZnegD1",
                         "ETL SIM energy vs #phi (-Z, Single(topo1D)/First(topo2D) disk);#phi_{SIM} [rad];E_{SIM} [MeV]",
@@ -574,6 +664,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                                       3.15,
                                       0.,
                                       100.);
+
   meHitEvsEta_[0] =
       ibook.bookProfile("EtlHitEvsEtaZnegD1",
                         "ETL SIM energy vs #eta (-Z, Single(topo1D)/First(topo2D) disk);#eta_{SIM};E_{SIM} [MeV]",
@@ -604,6 +695,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                                       3.2,
                                       0.,
                                       100.);
+
   meHitTvsPhi_[0] =
       ibook.bookProfile("EtlHitTvsPhiZnegD1",
                         "ETL SIM time vs #phi (-Z, Single(topo1D)/First(topo2D) disk);#phi_{SIM} [rad];T_{SIM} [ns]",
@@ -634,6 +726,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                                       3.15,
                                       0.,
                                       100.);
+
   meHitTvsEta_[0] =
       ibook.bookProfile("EtlHitTvsEtaZnegD1",
                         "ETL SIM time vs #eta (-Z, Single(topo1D)/First(topo2D) disk);#eta_{SIM};T_{SIM} [ns]",
@@ -663,7 +756,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                    14.5,
                    100,
                    0.,
-                   10.);
+                   20.);
 
   meNSimHitsPerEnteringTrackD2_ =
       ibook.book2D("NSimHitsPerEnteringTrackD2",
@@ -673,7 +766,7 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                    14.5,
                    100,
                    0.,
-                   10.);
+                   20.);
 
   meNSimHitsFace2VsFace1D1_ =
       ibook.book2D("NSimHitsFace2VsFace1D1",
@@ -695,6 +788,62 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                    -0.5,
                    9.5);
 
+  meSpaceDispersionXYD1_ =
+      ibook.book1D("SpaceDispersionXYD1",
+                   "ETL SIM hit space dispersion in D1;max pairwise #Delta r_{xy} [cm];Entries",
+                   100,
+                   0.,
+                   200.);
+
+  meSpaceDispersionXYD2_ =
+      ibook.book1D("SpaceDispersionXYD2",
+                   "ETL SIM hit space dispersion in D2;max pairwise #Delta r_{xy} [cm];Entries",
+                   100,
+                   0.,
+                   200.);
+
+  meSpaceDispersionRMSD1_ =
+      ibook.book1D("SpaceDispersionRMSD1",
+                   "ETL SIM hit RMS space dispersion in D1;RMS #Delta r_{xy} [cm];Entries",
+                   100,
+                   0.,
+                   100.);
+
+  meSpaceDispersionRMSD2_ =
+      ibook.book1D("SpaceDispersionRMSD2",
+                   "ETL SIM hit RMS space dispersion in D2;RMS #Delta r_{xy} [cm];Entries",
+                   100,
+                   0.,
+                   100.);
+
+  meTimeDispersionD1_ =
+      ibook.book1D("TimeDispersionD1",
+                   "ETL SIM hit time dispersion in D1;max(ToF)-min(ToF) [ns];Entries",
+                   100,
+                   0.,
+                   500.);
+
+  meTimeDispersionD2_ =
+      ibook.book1D("TimeDispersionD2",
+                   "ETL SIM hit time dispersion in D2;max(ToF)-min(ToF) [ns];Entries",
+                   100,
+                   0.,
+                   500.);
+
+  meTimeDispersionLatestOffset4D1_ =
+      ibook.book1D("TimeDispersionLatestOffset4D1",
+                   "ETL SIM hit time dispersion in D1, latest hit offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
+                   100,
+                   0.,
+                   500.);
+
+  meTimeDispersionLatestOffset4D2_ =
+      ibook.book1D("TimeDispersionLatestOffset4D2",
+                   "ETL SIM hit time dispersion in D2, latest hit offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
+                   100,
+                   0.,
+                   500.);
+
   if (optionalPlots_) {
     meHitThetaEntryD1_[0] =
         ibook.book1D("HitThetaEntryD1_eta1", "ETL SIM hits D1 theta at entry, 1.5 < |eta| <= 2.1", 60, 0., 180.);
@@ -712,14 +861,13 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
   }
 }
 
-// ------------ method fills 'descriptions' with the allowed parameters for the module  ------------
 void EtlSimHitsValidation::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
   edm::ParameterSetDescription desc;
 
   desc.add<std::string>("folder", "MTD/ETL/SimHits");
   desc.add<edm::InputTag>("inputTag", edm::InputTag("mix", "g4SimHitsFastTimerHitsEndcap"));
   desc.add<edm::InputTag>("simTrackTag", edm::InputTag("g4SimHits"));
-  desc.add<double>("hitMinimumEnergy2Dis", 0.001);  // [MeV]
+  desc.add<double>("hitMinimumEnergy2Dis", 0.001);
   desc.add<bool>("optionalPlots", false);
 
   descriptions.add("etlSimHitsValid", desc);
