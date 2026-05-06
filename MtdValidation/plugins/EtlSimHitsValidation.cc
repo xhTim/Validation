@@ -63,6 +63,8 @@ struct EnteringTrackDiskSummary {
 
   std::array<int, 2> nSimHitsPerDisk{{0, 0}};
   std::array<std::array<int, 2>, 2> nSimHitsPerDiskFace{{{{0, 0}}, {{0, 0}}}};
+  std::array<int, 2> nFrontHitsPerDisk{{0, 0}};
+  std::array<int, 2> nBackscatterHitsPerDisk{{0, 0}};
   std::array<std::vector<HitInfo>, 2> hitsPerDisk;
 
   float trackPtAtProduction = -1.f;
@@ -82,6 +84,12 @@ struct EnteringTrackDiskSummary {
 
     if (face == 0 || face == 1) {
       ++nSimHitsPerDiskFace[diskIndex][face];
+    }
+
+    if (offsetTrackId == 0) {
+      ++nFrontHitsPerDisk[diskIndex];
+    } else if (offsetTrackId == 4) {
+      ++nBackscatterHitsPerDisk[diskIndex];
     }
 
     hitsPerDisk[diskIndex].push_back({x, y, z, tof, face, offsetTrackId});
@@ -155,6 +163,19 @@ static DispersionResult computeDispersion(const std::vector<EnteringTrackDiskSum
   return result;
 }
 
+static DispersionResult computeDispersionOffset0Only(const std::vector<EnteringTrackDiskSummary::HitInfo>& hits) {
+  std::vector<EnteringTrackDiskSummary::HitInfo> selectedHits;
+  selectedHits.reserve(hits.size());
+
+  for (const auto& hit : hits) {
+    if (hit.offsetTrackId == 0) {
+      selectedHits.push_back(hit);
+    }
+  }
+
+  return computeDispersion(selectedHits);
+}
+
 class EtlSimHitsValidation : public DQMEDAnalyzer {
 public:
   explicit EtlSimHitsValidation(const edm::ParameterSet&);
@@ -205,6 +226,8 @@ private:
   MonitorElement* meNSimHitsPerEnteringTrackD2_ = nullptr;
   MonitorElement* meNSimHitsFace2VsFace1D1_ = nullptr;
   MonitorElement* meNSimHitsFace2VsFace1D2_ = nullptr;
+  MonitorElement* meNBackScatterVsFrontHitsD1_ = nullptr;
+  MonitorElement* meNBackScatterVsFrontHitsD2_ = nullptr;
 
   MonitorElement* meSpaceDispersionXYD1_ = nullptr;
   MonitorElement* meSpaceDispersionXYD2_ = nullptr;
@@ -297,6 +320,13 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
                                       convertMmToCm(position.y()),
                                       convertMmToCm(position.z()));
     const auto& globalPointForThisHit = thedetForThisHit->toGlobal(localPointForThisHit);
+
+    if (simHit.offsetTrackId() != 0 && simHit.offsetTrackId() != 4) {
+      throw cms::Exception("EtlSimHitsValidation")
+          << "Unexpected offsetTrackId " << simHit.offsetTrackId()
+          << " for originalTrackId " << simHit.originalTrackId()
+          << ", detId " << simHit.detUnitId();
+    }
 
     auto& enteringTrackSummary = enteringTracks[simHit.originalTrackId()];
     enteringTrackSummary.addHit(id.nDisc(),
@@ -426,25 +456,31 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
     if (summary.nSimHitsPerDisk[0] > 0) {
       meNSimHitsFace2VsFace1D1_->Fill(summary.nSimHitsPerDiskFace[0][0], summary.nSimHitsPerDiskFace[0][1]);
+      meNBackScatterVsFrontHitsD1_->Fill(summary.nFrontHitsPerDisk[0], summary.nBackscatterHitsPerDisk[0]);
 
       const auto dispersionD1 = computeDispersion(summary.hitsPerDisk[0]);
       meSpaceDispersionXYD1_->Fill(dispersionD1.maxPairwiseXY);
       meSpaceDispersionRMSD1_->Fill(dispersionD1.rmsXY);
       meTimeDispersionD1_->Fill(dispersionD1.timeSpread);
-      if (dispersionD1.latestOffsetTrackId == 0) {
-        meTimeDispersionLatestOffset4D1_->Fill(dispersionD1.timeSpread);
+
+      const auto dispersionD1Offset0Only = computeDispersionOffset0Only(summary.hitsPerDisk[0]);
+      if (summary.nFrontHitsPerDisk[0] > 0) {
+        meTimeDispersionLatestOffset4D1_->Fill(dispersionD1Offset0Only.timeSpread);
       }
     }
 
     if (summary.nSimHitsPerDisk[1] > 0) {
       meNSimHitsFace2VsFace1D2_->Fill(summary.nSimHitsPerDiskFace[1][0], summary.nSimHitsPerDiskFace[1][1]);
+      meNBackScatterVsFrontHitsD2_->Fill(summary.nFrontHitsPerDisk[1], summary.nBackscatterHitsPerDisk[1]);
 
       const auto dispersionD2 = computeDispersion(summary.hitsPerDisk[1]);
       meSpaceDispersionXYD2_->Fill(dispersionD2.maxPairwiseXY);
       meSpaceDispersionRMSD2_->Fill(dispersionD2.rmsXY);
       meTimeDispersionD2_->Fill(dispersionD2.timeSpread);
-      if (dispersionD2.latestOffsetTrackId == 0) {
-        meTimeDispersionLatestOffset4D2_->Fill(dispersionD2.timeSpread);
+
+      const auto dispersionD2Offset0Only = computeDispersionOffset0Only(summary.hitsPerDisk[1]);
+      if (summary.nFrontHitsPerDisk[1] > 0) {
+        meTimeDispersionLatestOffset4D2_->Fill(dispersionD2Offset0Only.timeSpread);
       }
     }
   }
@@ -788,6 +824,26 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                    -0.5,
                    9.5);
 
+  meNBackScatterVsFrontHitsD1_ =
+      ibook.book2D("NBackScatterVsFrontHitsD1",
+                   "ETL SIM hits per entering track in D1;N_{hits with offsetTrackId == 0};N_{hits with offsetTrackId == 4}",
+                   15,
+                   -0.5,
+                   14.5,
+                   15,
+                   -0.5,
+                   14.5);
+
+  meNBackScatterVsFrontHitsD2_ =
+      ibook.book2D("NBackScatterVsFrontHitsD2",
+                   "ETL SIM hits per entering track in D2;N_{hits with offsetTrackId == 0};N_{hits with offsetTrackId == 4}",
+                   15,
+                   -0.5,
+                   14.5,
+                   15,
+                   -0.5,
+                   14.5);
+
   meSpaceDispersionXYD1_ =
       ibook.book1D("SpaceDispersionXYD1",
                    "ETL SIM hit space dispersion in D1;max pairwise #Delta r_{xy} [cm];Entries",
@@ -832,14 +888,14 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
 
   meTimeDispersionLatestOffset4D1_ =
       ibook.book1D("TimeDispersionLatestOffset4D1",
-                   "ETL SIM hit time dispersion in D1, latest hit offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
+                   "ETL SIM hit time dispersion in D1 using only hits with offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
                    100,
                    0.,
                    500.);
 
   meTimeDispersionLatestOffset4D2_ =
       ibook.book1D("TimeDispersionLatestOffset4D2",
-                   "ETL SIM hit time dispersion in D2, latest hit offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
+                   "ETL SIM hit time dispersion in D2 using only hits with offsetTrackId == 0;max(ToF)-min(ToF) [ns];Entries",
                    100,
                    0.,
                    500.);
