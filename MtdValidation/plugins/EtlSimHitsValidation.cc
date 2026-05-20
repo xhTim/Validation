@@ -19,13 +19,12 @@
 #include <vector>
 #include <cmath>
 #include <limits>
-#include <iostream>
-#include <iomanip>
 
 #include "FWCore/Framework/interface/Frameworkfwd.h"
 #include "FWCore/Framework/interface/Event.h"
 #include "FWCore/Framework/interface/MakerMacros.h"
 #include "FWCore/ParameterSet/interface/ParameterSet.h"
+#include "FWCore/MessageLogger/interface/MessageLogger.h"
 
 #include "DQMServices/Core/interface/DQMEDAnalyzer.h"
 #include "DQMServices/Core/interface/DQMStore.h"
@@ -59,14 +58,8 @@ struct EnteringTrackDiskSummary {
     float y = 0.f;
     float z = 0.f;
     float tof = 0.f;
-    float energyLoss = 0.f;
     int face = -1;
     int offsetTrackId = -999;
-    unsigned int trackId = 0;
-    unsigned int originalTrackId = 0;
-    unsigned int detUnitId = 0;
-    int zside = 0;
-    int disc = 0;
   };
 
   std::array<int, 2> nSimHitsPerDisk{{0, 0}};
@@ -84,18 +77,7 @@ struct EnteringTrackDiskSummary {
     hasTrackPtAtProduction = true;
   }
 
-  void addHit(int disc,
-              int face,
-              float x,
-              float y,
-              float z,
-              float tof,
-              float energyLoss,
-              int offsetTrackId,
-              unsigned int trackId,
-              unsigned int originalTrackId,
-              unsigned int detUnitId,
-              int zside) {
+  void addHit(int disc, int face, float x, float y, float z, float tof, int offsetTrackId) {
     if (disc < 1 || disc > 2)
       return;
 
@@ -116,27 +98,19 @@ struct EnteringTrackDiskSummary {
       ++nBackscatterHitsPerDisk[diskIndex];
     }
 
-    hitsPerDisk[diskIndex].push_back({x,
-                                      y,
-                                      z,
-                                      tof,
-                                      energyLoss,
-                                      face,
-                                      offsetTrackId,
-                                      trackId,
-                                      originalTrackId,
-                                      detUnitId,
-                                      zside,
-                                      disc});
+    hitsPerDisk[diskIndex].push_back({x, y, z, tof, face, offsetTrackId});
   }
 };
 
 struct DispersionResult {
   float maxPairwiseXY = 0.f;
   float timeSpread = 0.f;
+  int earliestOffsetTrackId = -999;
   int latestOffsetTrackId = -999;
-  int maxPairIndex1 = -1;
-  int maxPairIndex2 = -1;
+
+  bool hasExtremeOffset4() const {
+    return earliestOffsetTrackId == 4 || latestOffsetTrackId == 4;
+  }
 };
 
 static DispersionResult computeDispersion(const std::vector<EnteringTrackDiskSummary::HitInfo>& hits) {
@@ -151,8 +125,10 @@ static DispersionResult computeDispersion(const std::vector<EnteringTrackDiskSum
   float maxTof = -std::numeric_limits<float>::max();
 
   for (const auto& hit : hits) {
-    if (hit.tof < minTof)
+    if (hit.tof < minTof) {
       minTof = hit.tof;
+      result.earliestOffsetTrackId = hit.offsetTrackId;
+    }
     if (hit.tof > maxTof) {
       maxTof = hit.tof;
       result.latestOffsetTrackId = hit.offsetTrackId;
@@ -167,56 +143,12 @@ static DispersionResult computeDispersion(const std::vector<EnteringTrackDiskSum
       const float dy = hits[i].y - hits[j].y;
       const float distXY = std::sqrt(dx * dx + dy * dy);
 
-      if (distXY > result.maxPairwiseXY) {
+      if (distXY > result.maxPairwiseXY)
         result.maxPairwiseXY = distXY;
-        result.maxPairIndex1 = static_cast<int>(i);
-        result.maxPairIndex2 = static_cast<int>(j);
-      }
     }
   }
 
   return result;
-}
-
-
-static void printLargeSpaceDispersionHits(const edm::Event& iEvent,
-                                           int originalTrackId,
-                                           int diskIndex,
-                                           const std::vector<EnteringTrackDiskSummary::HitInfo>& hits,
-                                           const DispersionResult& dispersion) {
-  if (dispersion.maxPairwiseXY <= 90.f)
-    return;
-
-  std::cout << std::fixed << std::setprecision(3);
-  std::cout << "[Large space dispersion] "
-            << "run=" << iEvent.id().run()
-            << ", lumi=" << iEvent.id().luminosityBlock()
-            << ", event=" << iEvent.id().event()
-            << ", originalTrackId=" << originalTrackId
-            << ", disk=D" << (diskIndex + 1)
-            << ", nHits=" << hits.size()
-            << ", maxPairwiseXY=" << dispersion.maxPairwiseXY << " cm"
-            << ", maxPairIndices=(" << dispersion.maxPairIndex1
-            << ", " << dispersion.maxPairIndex2 << ")"
-            << std::endl;
-
-  for (size_t ihit = 0; ihit < hits.size(); ++ihit) {
-    const auto& hit = hits[ihit];
-    std::cout << "  hit[" << ihit << "]"
-              << " trackId=" << hit.trackId
-              << " originalTrackId=" << hit.originalTrackId
-              << " offsetTrackId=" << hit.offsetTrackId
-              << " detUnitId=" << hit.detUnitId
-              << " zside=" << hit.zside
-              << " disc=" << hit.disc
-              << " face=" << hit.face
-              << " x=" << hit.x << " cm"
-              << " y=" << hit.y << " cm"
-              << " z=" << hit.z << " cm"
-              << " tof=" << hit.tof << " ns"
-              << " energyLoss=" << hit.energyLoss
-              << std::endl;
-  }
 }
 
 static DispersionResult computeDispersionOffset0Only(const std::vector<EnteringTrackDiskSummary::HitInfo>& hits) {
@@ -368,6 +300,11 @@ private:
   MonitorElement* meHitThetaEntryD1_[3];
   MonitorElement* meHitThetaEntryD2_[3];
 
+  unsigned long long nTimeDispersionD1_ = 0;
+  unsigned long long nTimeDispersionD2_ = 0;
+  unsigned long long nTimeDispersionExtremeOffset4D1_ = 0;
+  unsigned long long nTimeDispersionExtremeOffset4D2_ = 0;
+
   static constexpr int n_bin_Eta = 3;
   static constexpr double eta_bins_edges[n_bin_Eta + 1] = {1.5, 2.1, 2.5, 3.0};
 };
@@ -382,7 +319,22 @@ EtlSimHitsValidation::EtlSimHitsValidation(const edm::ParameterSet& iConfig)
   mtdtopoToken_ = esConsumes<MTDTopology, MTDTopologyRcd>();
 }
 
-EtlSimHitsValidation::~EtlSimHitsValidation() {}
+EtlSimHitsValidation::~EtlSimHitsValidation() {
+  const auto printExtremeOffset4Fraction = [](const char* label,
+                                              unsigned long long nExtremeOffset4,
+                                              unsigned long long nTotal) {
+    const double fraction = (nTotal > 0) ? static_cast<double>(nExtremeOffset4) / static_cast<double>(nTotal) : 0.0;
+    edm::LogPrint("EtlSimHitsValidation")
+        << "[Time dispersion extreme offsetTrackId == 4 fraction] " << label << "\n"
+        << "  entries with min(ToF) or max(ToF) from offsetTrackId == 4 = " << nExtremeOffset4 << "\n"
+        << "  total time-dispersion entries                         = " << nTotal << "\n"
+        << "  fraction                                              = " << fraction << "\n"
+        << "  percentage                                            = " << 100.0 * fraction << " %";
+  };
+
+  printExtremeOffset4Fraction("D1", nTimeDispersionExtremeOffset4D1_, nTimeDispersionD1_);
+  printExtremeOffset4Fraction("D2", nTimeDispersionExtremeOffset4D2_, nTimeDispersionD2_);
+}
 
 void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSetup& iSetup) {
   using namespace edm;
@@ -462,12 +414,7 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
                                 globalPointForThisHit.y(),
                                 globalPointForThisHit.z(),
                                 simHit.tof(),
-                                simHit.energyLoss(),
-                                simHit.offsetTrackId(),
-                                simHit.trackId(),
-                                simHit.originalTrackId(),
-                                simHit.detUnitId(),
-                                id.zside());
+                                simHit.offsetTrackId());
 
     if (!enteringTrackSummary.hasTrackPtAtProduction) {
       auto itPt = simTrackPtAtProduction.find(static_cast<unsigned int>(simHit.originalTrackId()));
@@ -580,8 +527,12 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
     if (summary.nSimHitsPerDisk[0] > 0) {
       const auto dispersionD1 = computeDispersion(summary.hitsPerDisk[0]);
-      printLargeSpaceDispersionHits(iEvent, enteringTrack.first, 0, summary.hitsPerDisk[0], dispersionD1);
       const auto dispersionD1Offset0Only = computeDispersionOffset0Only(summary.hitsPerDisk[0]);
+
+      ++nTimeDispersionD1_;
+      if (dispersionD1.hasExtremeOffset4()) {
+        ++nTimeDispersionExtremeOffset4D1_;
+      }
       const auto valuesD1 = makePerDiskSummaryValues(summary, 0, dispersionD1, dispersionD1Offset0Only);
 
       fillDiskSummaryHistograms(valuesD1,
@@ -598,8 +549,12 @@ void EtlSimHitsValidation::analyze(const edm::Event& iEvent, const edm::EventSet
 
     if (summary.nSimHitsPerDisk[1] > 0) {
       const auto dispersionD2 = computeDispersion(summary.hitsPerDisk[1]);
-      printLargeSpaceDispersionHits(iEvent, enteringTrack.first, 1, summary.hitsPerDisk[1], dispersionD2);
       const auto dispersionD2Offset0Only = computeDispersionOffset0Only(summary.hitsPerDisk[1]);
+
+      ++nTimeDispersionD2_;
+      if (dispersionD2.hasExtremeOffset4()) {
+        ++nTimeDispersionExtremeOffset4D2_;
+      }
       const auto valuesD2 = makePerDiskSummaryValues(summary, 1, dispersionD2, dispersionD2Offset0Only);
 
       fillDiskSummaryHistograms(valuesD2,
@@ -999,14 +954,14 @@ void EtlSimHitsValidation::bookHistograms(DQMStore::IBooker& ibook,
                    "ETL SIM hit space dispersion in D1;max pairwise #Delta r_{xy} [cm];Entries",
                    100,
                    0.,
-                   200.);
+                   10.);
 
   meSpaceDispersionXYD2_ =
       ibook.book1D("SpaceDispersionXYD2",
                    "ETL SIM hit space dispersion in D2;max pairwise #Delta r_{xy} [cm];Entries",
                    100,
                    0.,
-                   200.);
+                   10.);
 
   meTimeDispersionD1_ =
       ibook.book1D("TimeDispersionD1",
